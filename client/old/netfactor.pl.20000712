@@ -1,0 +1,290 @@
+#!/usr/bin/perl
+use Socket;
+#require "factornet.pm";
+#require "factorbase.pm";
+$| = 1;
+
+# network info
+$SERVER = "208.167.68.254";
+$PORT = 9999;
+$SLEEP_TIME = 10;
+ 
+# Paths to the factoring binaries
+$BASIC="./basic";
+$GP="/usr/local/bin/gp";
+$ECM="./ecm";
+
+# Who I am
+my $machine = `uname -n`;
+chomp($machine);
+my $who = "Chris";
+#$who = $who . ":" . $machine;
+
+# The methods available to me
+my @methods_available = ("BASIC", "MPQS", "ECM");
+
+# The built-up work array
+my @work_out = ();
+my @work_in = ();
+
+##########
+
+# Appends the work log with the results of a trial factorization attempt
+# Call like factor_basic(num_id, n);
+sub factor_basic() {
+  my ($num_id, $n) = @_;
+  my $factor_count = 0;
+  my $method;
+  my $factor;
+
+  open(FACTOR_H, "nice -19 $BASIC $n|");
+  while(<FACTOR_H>) {
+    chomp($_);
+    # Grab one factor at a time and shove it into the work_out array
+    ($method, $factor, $notes) = split(/\s+/, $_, 3);
+    @work_out = (@work_out, "REPORT_FACTOR", $num_id, $factor, $method, $notes);
+    &logit("Factor of $num_id found by $method: $factor\n");
+    $factor_count++;
+  }
+  close(FACTOR_H);
+
+  # If we didn't find any factors, return the work done.
+  # The undef is for "no notes"
+  if($factor_count == 0) {
+    @work_out = (@work_out, "REPORT_WORK", $num_id, $n, "BASIC", undef);
+  }
+}
+
+##########
+
+sub factor_mpqs() {
+  my ($num_id, $n) = @_;
+  my $factor_count = 0;
+  my $factor;
+  my $power;
+
+  open(FACTOR_H, "echo \'factorint($n, 14)\' | nice -19 $GP 2>&1|");
+  while(<FACTOR_H>) {
+    chomp($_);
+    if ($_ =~ /\[(\d+)\s+(\d+)\]/) {
+      $factor = $1;
+      for($power=$2; $power > 0; $power--) {
+        @work_out = (@work_out, "REPORT_FACTOR", $num_id, $factor, "MPQS", undef);
+        &logit("Factor of $num_id found by MPQS: $factor\n");
+        $factor_count++;
+      }
+    }
+  }
+  close(FACTOR_H);
+
+  if($factor_count == 0) {
+    @work_out = (@work_out, "REPORT_WORK", $num_id, $n, "MPQS", undef);
+  }
+}
+
+##########
+
+sub factor_ecm() {
+  my ($num_id, $n, $notes) = @_;
+
+  my $sigma;
+  my $step;
+  my $factor;
+
+  my $b1;
+  my $max_curves;
+  my $curve_count;
+
+  if($notes =~ /B1=(\d+)/i) {
+    $b1 = $1;
+  } else {
+    &logit("ECM paramaters malformed: $notes\n");
+    return();
+  }
+
+  if($notes =~ /CURVES=(\d+)/i) {
+    $max_curves = $1;
+  } else {
+    &logit("ECM paramaters malformed: $notes\n");
+    return();
+  }
+
+  for($curve_count = 1; $curve_count <= $max_curves; $curve_count++) {
+    $sigma = undef;
+    $step = undef;
+    $factor = undef;
+
+    open(FACTOR_H, "echo $n | nice -19 $ECM $b1|");
+    while(<FACTOR_H>) {
+      chomp($_);
+      if ($_ =~ /sigma=(\d+)/i) {
+        $sigma = $1;
+      } elsif ($_ =~ /factor found in step (\d+):\s*(\d+)/i) {
+        $step = $1;
+        $factor = $2;
+      }
+    }
+    close(FACTOR_H);
+    &logit("Completed $curve_count curves on $num_id\n");
+    if($factor) {
+      last;
+    }
+  }
+
+  # If no factor, the "for" loop incremented the curve count
+  if(!$factor) {
+    $curve_count--;
+  }
+
+  # For proper bookkeeping, we should report curves completed before
+  # factors found.
+  @work_out = (@work_out, "REPORT_WORK", $num_id, $n, "ECM", "B1=$b1 CURVES=$curve_count");
+
+  if($factor) {
+    @work_out = (@work_out, "REPORT_FACTOR", $num_id, $factor, "ECM", "B1=$b1 SIGMA=$sigma STEP=$step");
+    &logit("Factor of $num_id found by ECM: $factor\n");
+  }
+}
+
+##########
+
+sub do_work() {
+  while(@work_in) {
+    my $num_id = shift(@work_in);
+    my $n = shift(@work_in);
+    my $method = shift(@work_in);
+    my $notes = shift(@work_in);
+
+    if("$method" eq "BASIC") {
+      &logit("Doing BASIC test on $num_id: $n\n");
+      &factor_basic($num_id, $n, $notes);
+    } elsif ("$method" eq "ECM") {
+      &logit("Doing ECM on $num_id: $n ($notes)\n");
+      &factor_ecm($num_id, $n, $notes);
+    } elsif ("$method" eq "MPQS") {
+      &logit("Doing MPQS on $num_id: $n\n");
+      &factor_mpqs($num_id, $n, $notes);
+    } else {
+      &logit("Unknown method $method for $num_id = $n\n");
+    }
+  }
+}
+
+##########
+
+sub return_work() {
+  &logit("Returning " . (($#work_out + 1)/5) . " items to server...\n");
+  &con();
+  print S "REPORT $who\n";
+  while(@work_out) {
+    my $report_type = shift(@work_out);
+    my $num_id = shift(@work_out);
+    my $n = shift(@work_out);
+    my $method = shift(@work_out);
+    my $notes = shift(@work_out);
+    
+    print S "$report_type $num_id $n $method $notes\n";
+    
+  }
+  @work_out = ();
+  print S "DONE\n";
+  close(S);
+}
+
+##########
+
+sub goget(){
+  my $who = shift(@_);
+  my @methods = @_;
+  my $method;
+  my @todo = ();
+
+  $method = shift(@methods);
+  for(@methods){
+   $method = join ' ', $method, $_;
+  }
+  
+  print S "REQUEST $who:$machine $method\n";
+  
+  # listen to our work list
+  
+  while($work = <S>){
+   chop($work);
+   if($work eq "DONE"){
+    last;
+   }
+   @todo = (@todo, $work);
+  }
+  close(S);
+  return(@todo); 
+  
+}
+
+##########
+
+sub con{
+
+ my ($iaddr, $paddr, $proto);
+ 
+ $iaddr = inet_aton($SERVER);
+ $paddr = sockaddr_in($PORT,$iaddr);
+ $proto = getprotobyname('tcp');
+ 
+ if (socket(S,AF_INET, SOCK_STREAM, $proto)) {
+      ($DEBUG) ? &logit("Socket creation succeeded.\n"):undef;
+  }
+
+ unless (connect (S, $paddr)){
+  &logit("connect failed: $!\n");
+  &logit("sleeping for $SLEEP_TIME...\n");
+  sleep($SLEEP_TIME);
+  con();
+  return;
+ } else {
+  ($DEBUG) ? &logit("connect success\n"):undef;
+ }
+
+ select(S);
+ $| = 1;
+ select(STDOUT);
+ 
+ @gotten = (split /:/, <S>);
+  chomp(@gotten);
+  &logit("Server MOTD: " . @gotten[2] . "\n");
+  
+}
+
+##########
+
+sub logit{
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time());
+ my $logln = shift(@_);
+# open CLOG, ">>$clientlogf";
+#  print CLOG $logln;
+# close(CLOG);
+ print "[$mon/$wday/" . (1900+$year) . "-$hour:$min] " . $logln;
+ 
+}
+
+
+##########
+
+while(1) {
+  &logit("Getting work from server... $SERVER $PORT\n");
+  &con();
+  @work_in = ();
+  @work_in = &goget($who, @methods_available);
+
+  if (! @work_in) {
+    &logit("No work to do.  Exiting.\n");
+    exit(0);
+  }
+
+  print("Received " . (($#work_in + 1)/4) . " items from server.\n");
+  
+  
+  do_work();
+  
+
+  return_work();
+}

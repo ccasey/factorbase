@@ -1,0 +1,731 @@
+# The factorbase server library
+
+use FileHandle;
+use IPC::Open2;
+use DBI();
+
+# Settings
+$PTEST_REPS=20;			# The number of Miller-Rabin reps to do
+$DATABASE_DRIVER="mysql";
+$DATABASE_NAME="FactorBase";
+$DATABASE_HOST="localhost";
+$DATABASE_USER="root";
+$DATABASE_PASSWORD=undef;	# Leave password undefined.
+
+# Amount of work to hand out per method
+$BASIC_WORK_MAX=100;
+$BASIC_WORK_MAX_DESPERATE=10;
+
+# The amount of "work" of an ECM curve is calculated like:
+#   work = (digits/10) * (bound/1000)
+# Example: An 80-digit number at B1=2000 has "work" of 16
+# ECM work limit is the minimum amount of total ECM work to hand out.
+$ECM_WORK_MIN=10000;
+
+# The minimal size composite to test at each bound
+%ECM_MIN_SIZE = (
+  2000     => 30,
+  11000    => 45,
+  50000    => 60,
+  250000   => 70,
+  1000000  => 80,
+  3000000  => 90,
+  11000000 => 100,
+  43000000 => 110
+);
+
+# The number of curves to try at each bound
+%ECM_MAX_CURVES = (
+  2000     => 25,
+  11000    => 90,
+  50000    => 300,
+  250000   => 700,
+  1000000  => 1800,
+  3000000  => 5100,
+  11000000 => 10600,
+  43000000 => 19300
+);
+
+# Which bound to use next.  This is done with a hash instead of an array
+# and function call, hopefully to save time.
+%ECM_NEXT_BOUND = (
+  0        => 2000,
+  2000     => 11000,
+  11000    => 50000,
+  50000    => 250000,
+  250000   => 1000000,
+  1000000  => 3000000,
+  3000000  => 11000000,
+  11000000 => 43000000
+);
+
+# MPQS SETTINGS
+$MPQS_MAX_SIZE=70;	# Don't automatically schedule any MPQS for numbers
+			# larger than this.
+
+# Paths
+$CALC="/usr/local/bin/calc";
+
+
+# Shared variables;
+# $DATABASE_H;		# The database handle, don't declare it as "my"
+			# so calling programs can access it.
+
+# State variables
+$CALC_OPENED=0;
+$DATABASE_OPENED=0;
+$LOG_OPENED=0;
+
+# Logfile settings
+$LOGFILE="factorbase.log";
+
+# Various logging levels
+$LOG_NONE=-1;	# Never logged
+$LOG_ERROR=0;	# Errors
+$LOG_INFO=1;	# Regular or interesting information
+$LOG_DEBUG=2;	# Noise
+
+$LOG_LEVEL = $LOG_INFO;
+$LOG_TO_STDOUT = 1;
+
+# The logging routine
+# Usage: printlog($level, $message)
+# Where $level is one of the logging levels defined above
+sub printlog() {
+  my ($msg_level, $log_message) = @_;
+  my $datestr;
+
+  if(($msg_level > $LOG_LEVEL) || ($log_message eq "")) {
+    return();
+  }
+
+  $log_message = "[" . &datetime() . "] $log_message";
+
+  if($LOG_TO_STDOUT) {
+    printf("$log_message\n");
+  }
+
+  # If no logfile specified, get out.
+  if (!$LOGFILE) {
+    return();
+  }
+
+  if(!$LOG_OPENED) {
+    # When we open the logfile, we definitely want autoflush
+    $| = 1;
+    if(!open(LOG_H, ">>$LOGFILE")) {
+      $LOGFILE=undef;
+      # Ooh, recursion...
+      &printlog($LOG_ERROR, "Cannot open $LOGFILE.  Logfile disabled.");
+      return();
+    }
+  }
+
+  print(LOG_H "$log_message\n");
+}
+    
+
+# Close the calc handles
+sub close_calc() {
+  if(!$CALC_OPENED) {
+    return;
+  }
+
+  close(CALC_READ_H);
+  close(CALC_WRITE_H);
+  $CALC_OPENED=0;
+}
+
+# Make a call to calc.
+sub calc() {
+  my $function = shift(@_);
+  my $retval;
+
+  # Open calc if it isn't already
+  if(!$CALC_OPENED) {
+    if(!open2(*CALC_READ_H, *CALC_WRITE_H, "$CALC")) {
+      &printlog($LOG_ERROR, "Cannot open calc: $CALC");
+      exit(-1);
+    }
+    $CALC_OPENED=1;
+  }
+
+  if(!print(CALC_WRITE_H "print $function\n")) {
+    &printlog($LOG_ERROR, "Cannot talk to calc.");
+    exit(-1);
+  }
+  $retval = <CALC_READ_H>;
+  chomp($retval);
+  return($retval);
+}
+
+# Close the database if it's opened.
+sub close_database() {
+  if(!$DATABASE_OPENED) {
+    return;
+  }
+
+  $DATABASE_H->disconnect();
+  $DATABASE_OPENED=0;
+  &printlog($LOG_INFO, "Database $DATABASE_NAME closed.");
+}
+
+
+# Open a connection to the database
+sub open_database() {
+  if($DATABASE_OPENED) {
+    return;
+  }
+
+  # Connect to the database
+  $DATABASE_H = DBI->connect(
+    "DBI:$DATABASE_DRIVER:database=$DATABASE_NAME;host=$DATABASE_HOST",
+    $DATABASE_USER, $DATABASE_PASSWORD, {'RaiseError' => 1});
+  
+  if(!$DATABASE_H) {
+    &printlog($LOG_ERROR, "Cannot open database $DATABASE_NAME.");
+    exit(-1);
+  }
+
+  &printlog($LOG_INFO, "Database $DATABASE_NAME opened.");
+  $DATABASE_OPENED=1;
+}
+
+
+# Test a number for primality
+sub is_prime() {
+  my $N = shift(@_);
+  my $status;
+
+  $status=&calc("ptest($N, $PTEST_REPS)");
+  if("$status" eq "0") {
+    return(0);
+  } elsif ("$status" eq "1") {
+    return(1);
+  } else {
+    # Some error.
+    &printlog($LOG_ERROR, "Calc returned nonsense for ptest($N, $PTEST_REPS): $status");
+    exit(-1);
+  }
+}
+
+
+# Return a mysql-formatted current datetime string
+sub datetime() {
+  ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time());
+
+  $mon++;
+  $year += 1900;
+  return(sprintf("%04d-%02d-%02d %02d:%02d:%02d", $year, $mon, $mday,
+    $hour, $min, $sec));
+}
+
+
+# Return either undefined, PRIME, or COMPOSITE, depending on the number.
+sub calc_status() {
+ my $n = shift(@_);
+
+  if(("$n" eq "1") || ("$n" eq "0")) {
+    return("TRIVIAL");
+  } elsif(&is_prime("$n")) {
+    return("PRIME");
+  } else {
+    return("COMPOSITE");
+  }
+}
+
+# A quick way to do a one-row select
+sub select_one() {
+  my $statement = shift(@_);
+  my $sth;	# A statment return handle
+  my $ref;	# An array reference
+
+  $sth = $DATABASE_H->prepare("$statement limit 1");
+  $sth->execute();
+  $ref = $sth->fetchrow_hashref();
+  $sth->finish();
+  return($ref);
+}
+
+# An easy way to do a "select count(*)" without mucking with statement
+# handlers and such.
+sub select_count() {
+  my $statement = shift(@_);
+  my $ref;	# An array reference
+
+  $ref = &select_one("select count(*) $statement");
+  return($ref->{'count(*)'});
+}
+
+# Add a factor to the database
+sub add_factor() {
+  my ($num_id, $factor, $power, $status, $method, $date, $who, $notes) = @_;
+  my $ref;	# An array reference
+  
+  # First, determine if copies exists in the database.
+  $ref = &select_one("select power from factor where num_id=\"$num_id\" and factor=\"$factor\"");
+  if($ref) {
+    $power += $ref->{'power'};
+    $DATABASE_H->do("update low_priority factor SET power=$power where num_id=\"$num_id\" and factor=\"$factor\"");
+  } else {
+    # Otherwise, create a new entry
+    $DATABASE_H->do
+      ("insert delayed into factor VALUES (?, ?, ?, ?, ?, ?, ?, ?)", undef,
+      $num_id, $factor, $power, $status, $method, $date, $who, $notes);
+  }
+}
+    
+
+# Insert a new number into the database to be factored.
+sub add_number() {
+  my ($num_id, $number, $unsafe) = @_;
+  my $power = 1;
+  my $status;
+  my $method = "BASIC";
+  my $date = undef;
+  my $who = undef;
+  my $notes = undef;
+
+  # First, see if any such entries exist in the number table
+  # If it exists, return.
+  if(!$unsafe) {
+    if(&select_count("from number where num_id=\"$num_id\"") > 0) {
+      &printlog($LOG_ERROR, "Entry for $num_id already exists in number table.");
+      return;
+    }
+  }
+
+  # Determine if it's PRIME or COMPOSITE
+  $status=&calc_status($number);
+  
+print "$num_id, $number, $status\n";
+
+  # Add it into the table
+  &printlog($LOG_DEBUG, "Inserting $num_id = $number ($status) into number table.");
+  $DATABASE_H->do("INSERT delayed INTO number VALUES (?, ?, ?)", undef,
+    $num_id, $number, $status);
+
+  # Only add composites into the factor table
+  if($status ne "COMPOSITE") {
+    return();
+  }
+
+  &printlog($LOG_DEBUG, "Adding $num_id to factor table.");
+  # And into the factor table.
+  # We could call add_factor, but this is more direct.
+  # &add_factor($num_id, $number, $power, $status, $method, $date, $who, $notes);
+  $DATABASE_H->do("INSERT delayed INTO factor VALUES (?, ?, ?, ?, ?, ?, ?, ?)", undef, $num_id, $number, $power, $status, $method, $date, $who, $notes);
+}
+  
+
+# Add divisor of a number currently in the factor table
+sub add_divisor() {
+  my ($num_id,$divisor,$method,$date,$who,$notes) = @_;
+
+  my $sth;		# A statment return handle
+  my $ref;		# An array reference
+  my $factor;		# The factor (searched for) that this divisor divides.
+
+  # Things applying to the divisor
+  my $power;
+  my $status;		# If the factor is prime or composite
+
+  # Things applying to the cofactor
+  my $cofactor;		# The remaining part of the old factor
+  my $costatus;		# Whether cofactor is PRIME or COMPOSITE
+  my $comethod;		# The "method" credited for the cofactor
+  my $codate;		# Default is same as the divisor
+  
+  # Find all composite factors of this num_id
+  $sth = $DATABASE_H->prepare("select * from factor where num_id=\"$num_id\" and status=\"COMPOSITE\"");
+  $sth->execute();
+  # Find one that the reported divisor divides
+  while($ref = $sth->fetchrow_hashref()) {
+    $factor = $ref->{'factor'};
+
+    if(("$factor" ne "$divisor") && (&calc("$factor % $divisor") eq "0")) {
+      # We've found one.  Break out.
+      last;
+    }
+  }
+  $sth->finish();
+
+  # Get out if we didn't find one.
+  if(!defined($ref)) {
+    &printlog($LOG_INFO, "Reported factor of $num_id divides no remaining composite: $divisor");
+    return();
+  }
+
+  # From here on, we know we have a legitimate factor
+
+  # Mark the number as "INCOMPLETE" meaning incompletely factored.
+  # Further down, the number is checked again for complete factorization.
+  # This should be made cleaner some day :)
+  $DATABASE_H->do("update low_priority number SET status=\"PARTIAL\" where num_id=\"$num_id\"");
+
+  # Purify blanks to NULL
+  if("$method" eq "") {
+    $method=undef;
+  }
+
+  if ("$date" eq "") {
+    # Blank/null date means use current
+    $date = &datetime();
+  }
+
+  if("$who" eq "") {
+    $who = undef;
+  }
+
+  if("$notes" eq "") {
+    $notes = undef;
+  }
+
+  # Assume cofactor's datestamp is same as divisors;
+  $codate = $date;
+
+  # Set the power to that of the parent
+  $power = $ref->{'power'};
+
+  # Determine status of reported divisor
+  $status = &calc_status($divisor);
+
+  # If the factor found is composite, schedule it for "BASIC" testing
+  # because this is most likely a small composite that should be
+  # cracked by trial, rho, or small ECM testing.
+  if ("$status" eq "COMPOSITE") {
+    $method = "BASIC";
+    $date = undef;
+  }
+
+  # Insert the new divisor
+  &printlog($LOG_INFO, "$status factor of $num_id accepted: $divisor");
+  &add_factor($num_id, $divisor, $power, $status, $method, $date, $who,
+    $notes);
+
+  # Get info about the cofactor
+  $cofactor=&calc("$factor / $divisor");
+  $costatus=&calc_status($cofactor);
+
+  # If the cofactor is composite, add it to the factor table,
+  # retaining the parent's method
+  if("$costatus" eq "COMPOSITE") {
+    $comethod = $ref->{'method'};
+    $codate = undef;
+
+    &add_factor($num_id, $cofactor, $power, $costatus, $comethod, $codate,
+      $who, undef);
+
+    # Any of parent's ECM work should apply to cofactor.
+    if(&select_count("from ecm where num_id=\"$num_id\" and factor=\"$factor\"") > 0) {
+      $DATABASE_H->do("update low_priority ecm SET factor=\"$cofactor\" where num_id=\"$num_id\" and factor=\"$factor\"");
+      # Now, check if the cofactor has an ACTIVE ecm test
+      $ref = &select_one("select b1 from ecm where num_id=\"$num_id\" and factor=\"$cofactor\" and status=\"ACTIVE\"");
+
+      # If we have one and it's not sane, disable it and schedule MPQS
+      if(defined($ref) && (length($cofactor) < $ECM_MIN_SIZE{$ref->{'b1'}})) {
+        $DATABASE_H->do("update low_priority ecm SET status=\"INACTIVE\" where num_id=\"$num_id\" and factor=\"$cofactor\" and status=\"ACTIVE\"");
+        &schedule_mpqs($num_id, $cofactor);
+      }
+    }
+  } else {
+    # The cofactor is prime
+
+    # MPQS should get credit for both halves
+    if("$method" eq "MPQS") {
+      $comethod = "MPQS";
+    } else {
+      $comethod = "COFACTOR";
+    }
+
+    &add_factor($num_id, $cofactor, $power, $costatus, $comethod, $codate,
+      $who, undef);
+
+    # Delete the old number's ECM entries
+    $DATABASE_H->do
+      ("delete low_priority from ecm where num_id=\"$num_id\" and factor=\"$factor\"");
+  }
+
+  # Delete the old factor
+  $DATABASE_H->do("delete low_priority from factor where num_id=\"$num_id\" and factor=\"$factor\"");
+
+  # If both were prime, there's a chance $num_id is completely
+  # factored, in which case we should mark it as such.
+  if(("$costatus" eq "PRIME") && ("$status" eq "PRIME")) {
+    if(&select_count("from factor where num_id=\"$num_id\" and status=\"COMPOSITE\"") == 0) {
+      &printlog($LOG_INFO, "Factorization of $num_id is complete.");
+      $DATABASE_H->do("update low_priority number SET status=\"COMPLETE\" where num_id=\"$num_id\"");
+    }
+  }
+}
+
+
+# Schedule a factor for MPQS factoring
+sub schedule_mpqs() {
+  my ($num_id, $factor) = @_;
+  my $nextmethod;
+
+  # Only schedule it if the size is reasonable
+  if(length($factor) <= $MPQS_MAX_SIZE) {
+    $nextmethod="MPQS";
+  } else {
+    $nextmethod="MANUAL";
+  }
+
+  &printlog($LOG_INFO, "Scheduling $num_id for $nextmethod: $factor");
+  $DATABASE_H->do("update low_priority factor SET method=\"$nextmethod\",date=NULL where num_id=\"$num_id\" and factor=\"$factor\"");
+}
+
+
+# Schedule a factor for ECM factoring AFTER specified bound
+sub schedule_next_ecm() {
+  my ($num_id, $factor, $b1) = @_;
+
+  # If we've reached the max, schedule MPQS
+  # Or if the length of the factor isn't high enough for the next test.
+  if((!defined($ECM_NEXT_BOUND{$b1})) ||
+     (length($factor) < $ECM_MIN_SIZE{$ECM_NEXT_BOUND{$b1}})) {
+    &schedule_mpqs($num_id, $factor);
+    return();
+  }
+
+  # Schedule it for the next ECM test.
+  &printlog($LOG_INFO, "Scheduling $num_id for ECM at B1=$ECM_NEXT_BOUND{$b1}: $factor");
+  $DATABASE_H->do("insert delayed into ecm values (?, ?, ?, ?, ?)", undef,
+    $num_id, $factor, "ACTIVE", $ECM_NEXT_BOUND{$b1}, 0);
+
+  # We DON'T set the date to NULL because getwork_ecm hands out the
+  # oldest first, not NULL first.  This "spreads out" the work done
+  # on composites by ECM.
+  $DATABASE_H->do("update low_priority factor SET method=\"ECM\" where num_id=\"$num_id\" and factor=\"$factor\"");
+}
+
+
+sub process_work_ecm() {
+  my ($num_id, $factor, $notes) = @_;
+  my $curves;		# Curves sent
+  my $totcurves;	# Total curves run at this bound
+  my $b1;
+
+  my $ref;		# An array reference
+
+  if($notes =~ /B1=(\d+)/i) {
+    $b1 = $1;
+  } else {
+    &printlog($LOG_INFO, "ECM work notes malformed: $notes");
+    return();
+  }
+
+  if($notes =~ /CURVES=(\d+)/i) {
+    $curves = $1;
+  } else {
+    &printlog($LOG_INFO, "ECM work notes malformed: $notes");
+    return();
+  }
+
+  $ref = &select_one("select * from ecm where num_id=\"$num_id\" and factor=\"$factor\" and b1=\"$b1\"");
+
+  # If we got nothing back, return.
+  if(!defined($ref)) {
+    &printlog($LOG_INFO, "Ignoring $curves curves at B1=$b1 on $num_id: $factor");
+    return();
+  }
+
+  $totcurves = $ref->{'curves'} + $curves;
+  $DATABASE_H->do("update low_priority ecm SET curves=\"$totcurves\" where num_id=\"$num_id\" and factor=\"$factor\" and b1=\"$b1\"");
+
+  &printlog($LOG_INFO, "Accepted $curves curves at B1=$b1 on $num_id: $factor");
+
+  # Return if we haven't done the max number of curves, or if this
+  # factor was already marked inactive
+  if(($totcurves < $ECM_MAX_CURVES{$b1}) || ($ref->{'status'} ne "ACTIVE")) {
+    return();
+  }
+
+  # At this point, we know the number is active and has exceeded the
+  # max number of curves.
+
+  # Disable this number from the current ECM test.
+  $DATABASE_H->do("update low_priority ecm SET status=\"INACTIVE\" where num_id=\"$num_id\" and factor=\"$factor\" and b1=\"$b1\"");
+
+  # And schedule it for the next test
+  &schedule_next_ecm($num_id, $factor, $b1);
+}
+ 
+
+# Process work (failed attempts)
+sub process_work() {
+  my ($num_id, $factor, $method, $notes) = @_;
+
+  my $ref;		# An array reference
+
+  $ref = &select_one("select * from factor where num_id=\"$num_id\" and factor=\"$factor\" and status=\"COMPOSITE\"");
+
+  # Make sure such a thing exists.
+  if(!$ref) {
+    &printlog($LOG_INFO, "Cannot process $method work for nonexistant composite of $num_id: $factor");
+    return();
+  }
+
+  # If basic was requested and completed
+  if(("$method" eq "BASIC")  && ($ref->{'method'} eq "BASIC")) {
+    # Schedule it for ECM
+    &schedule_next_ecm($num_id, $factor, 0);
+  } elsif ("$method" eq "ECM") {
+    &process_work_ecm($num_id, $factor, $notes);
+  } elsif (("$method" eq "MPQS")  && ($ref->{'method'} eq "MPQS")) {
+    # Interpret this to mean MPQS was aborted, not failed.
+    # Let the scheduler figure it out.
+    &schedule_mpqs($num_id, $factor);
+  } else {
+    &printlog($LOG_INFO, "Unknown work method $method on composite of $num_id: $factor");
+  }
+}
+
+
+# The getwork routines.  call with: getwork_method($who, $desperate)
+# Return a list:
+#    num_id1, factor1, method1, notes1
+#     ...
+#    num_idX, factorX, methodX, notesX
+
+sub getwork_basic() {
+  my ($who, $desperate) = @_;
+
+  my $sth;	# Statement handle
+  my $ref;	# Reference handle
+  my $where;	# A string for the "where" clause
+  my @worklist = ();	# The list of work returned
+
+  if($desperate) {
+    $where = "order by date limit $BASIC_WORK_MAX_DESPERATE";
+  } else {
+    $where = "and date is NULL limit $BASIC_WORK_MAX";
+  }
+
+  $sth = $DATABASE_H->prepare("select * from factor where status=\"COMPOSITE\" and method=\"BASIC\" $where");
+  $sth->execute();  
+  while($ref = $sth->fetchrow_hashref()) {
+    @worklist = (@worklist, $ref->{'num_id'}, $ref->{'factor'}, "BASIC", $ref->{'notes'});
+    $DATABASE_H->do("update low_priority factor set date=\"" . &datetime() .  "\", who=\"$who\" where num_id=\"" . $ref->{'num_id'} . "\" and factor=\"" . $ref->{'factor'} . "\"");
+  }
+  $sth->finish();
+  return(@worklist);
+}
+
+sub getwork_ecm() {
+  my ($who, $desperate) = @_;
+  my $num_id;		# The parameters handed out
+  my $factor;
+  my $b1;
+  my $curves;
+  my $notes;
+
+  my $factorsth;	# Statement handle on the factor table
+  my $factorref;	# Reference handle on the factor table
+  my $ecmref;		# Reference handle on the ecm table
+
+  my $totwork = 0;	# The total "work" amount assigned
+  my @worklist = ();    # The list of work returned
+
+  # Desperate is currently ignored in ECM
+
+  $factorsth = $DATABASE_H->prepare("select * from factor where status=\"COMPOSITE\" and method = \"ECM\" order by date limit 100");
+  $factorsth->execute();
+
+  while(($totwork < $ECM_WORK_MIN) &&
+        ($factorref = $factorsth->fetchrow_hashref())) {
+    $num_id = $factorref->{'num_id'};
+    $factor = $factorref->{'factor'};
+
+    $ecmref = &select_one("select * from ecm where num_id=\"$num_id\" and factor=\"$factor\" and status=\"ACTIVE\"");
+    $b1 = $ecmref->{'b1'};
+    $curves = $ECM_MAX_CURVES{$ecmref->{'b1'}} - $ecmref->{'curves'};
+
+    $notes = "B1=$b1 CURVES=$curves";
+    @worklist = (@worklist, $num_id, $factor, "ECM", $notes);
+    $totwork += (length($factor)/10.0) * ($b1/1000.0) * $curves;
+    $DATABASE_H->do("update low_priority factor set date=\"" . &datetime() .  "\", who=\"$who\" where num_id=\"$num_id\" and factor=\"$factor\"");
+  }
+  $factorsth->finish();
+  return(@worklist);
+}
+
+sub getwork_mpqs() {
+  my ($who, $desperate) = @_;
+  my $ref;      # Reference handle
+  my $where;    # A string for the "where" clause
+  my @worklist = ();    # The list of work returned
+
+  if($desperate) {
+    $where = "order by date";
+  } else {
+    $where = "and date is NULL";
+  }
+
+  $ref = &select_one("select * from factor where status=\"COMPOSITE\" and method= \"MPQS\" $where");
+  if($ref) {
+    @worklist = (@worklist, $ref->{'num_id'}, $ref->{'factor'}, "MPQS", $ref->{'notes'});
+    $DATABASE_H->do("update low_priority factor set date=\"" . &datetime() .  "\", who=\"$who\" where num_id=\"" . $ref->{'num_id'} . "\" and factor=\"" . $ref->{'factor'} . "\"");
+  }
+
+  return(@worklist);
+}
+
+# The main getwork call.  Call like getwork($who, $method1, ..., $methodX)
+# Return a list:
+#    num_id1, factor1, method1, notes1
+#     ...
+#    num_idX, factorX, methodX, notesX
+sub getwork() {
+  my $who = shift(@_);
+  my @methods = @_;
+
+  my $method = undef;
+  my @worklist = ();
+
+  # First, try non-desperately to get work.
+  for(@methods) {
+    $method = $_;
+    if("$method" eq "BASIC") {
+      @worklist = &getwork_basic($who);
+    } elsif ("$method" eq "ECM") {
+      @worklist = &getwork_ecm($who);
+    } elsif ("$method" eq "MPQS") {
+      @worklist = &getwork_mpqs($who);
+    }
+    if(@worklist) {
+      &printlog($LOG_INFO, "Assigned " . (($#worklist+1)/4) . " items to $who");
+      return(@worklist);
+    }
+  }
+
+  # We're still here.  Try desperate.
+  for(@methods) {
+    $method = $_;
+    if("$method" eq "BASIC") {
+      @worklist = &getwork_basic($who, DESPERATE);
+    } elsif ("$method" eq "MPQS") {
+      @worklist = &getwork_mpqs($who, DESPERATE);
+    }
+    # We don't ask for "desperate" ECM test, since that doesn't apply (yet)
+
+    if(@worklist) {
+      &printlog($LOG_INFO, "Assigned " . (($#worklist+1)/4) . "items to $who");
+      return(@worklist);
+    }
+  }
+
+  # If we get this far, we have no work to assign.  Return nothing.
+  &printlog($LOG_INFO, "Nothing available for $who with methods @methods");
+  return();
+}
+
+# Code to run upon exiting
+END {
+  &close_calc();
+  &close_database();
+}
+
+# Return a successful load
+1;

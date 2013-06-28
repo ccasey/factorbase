@@ -1,0 +1,30 @@
+Where clauses by table (methods used)
+
+number:
+  num_id (add_number (in safe mode))
+  num_id (add_divisor (when completely factored))
+
+factor:
+  num_id (add_divisor)
+  num_id, n (add_factor, add_divisor, schedule_mpqs, schedule_next_ecm,
+             getwork_basic, getwork_ecm, getwork_mpqs)
+  num_id, n, status (process_work)
+  status, method, date (getwork_basic, getwork_ecm, getwork_mpqs)
+  
+ecm:
+  num_id, n (add_divisor, process_work_ecm)
+  num_id, n, status (add_divisor, getwork_ecm)
+  num_id, n, b1 (process_work_ecm)
+
+----
+Note that you can only add a index on a column that can have NULL values
+or on a BLOB/TEXT column if you are useing MySQL version 3.23.2 or newer
+and are using the MyISAM table type.
+
+Index ideas:
+  number by (num_id(20))
+  numbet by (status(10))
+  factor by (num_id(20), n(10), status(10))
+  factor by (status(10), method(10), date)
+  ecm by (num_id(20), n(10), status(10))
+  ecm by (num_id(20), n(10), b1)

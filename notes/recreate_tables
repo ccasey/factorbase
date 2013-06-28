@@ -1,0 +1,51 @@
+Re-creating tables:
+-------------------
+
+mysql> connect FactorBase;
+Reading table information for completion of table and column names
+You can turn off this feature to get a quicker startup with -A
+
+Connection id:    14
+Current database: FactorBase
+
+mysql> drop table number;
+Query OK, 0 rows affected (0.03 sec)
+
+mysql> drop table factor;
+Query OK, 0 rows affected (0.02 sec)
+
+mysql> drop table ecm;
+Query OK, 0 rows affected (0.03 sec)
+
+mysql> create table number (num_id varchar(32), number varchar(255), status varchar(16));
+Query OK, 0 rows affected (0.03 sec)
+
+mysql> create table factor (num_id varchar(32), factor varchar(255), power integer unsigned, status varchar(16), method varchar(16), date datetime, who varchar(64), notes varchar(255));
+Query OK, 0 rows affected (0.05 sec)
+
+mysql> create table ecm (num_id varchar(32), factor varchar(255), status varchar(16), b1 int unsigned, curves int unsigned);
+Query OK, 0 rows affected (0.03 sec
+
+mysql> create index num_id on number(num_id);
+Query OK, 0 rows affected (0.27 sec)
+Records: 0  Duplicates: 0  Warnings: 0
+
+mysql> create index status on number (status(8));
+Query OK, 0 rows affected (0.25 sec)
+Records: 0  Duplicates: 0  Warnings: 0
+
+mysql> create index num_id_factor_status on factor (num_id, factor(8), status(8));
+Query OK, 0 rows affected (0.23 sec)
+Records: 0  Duplicates: 0  Warnings: 0
+
+mysql> create index status_method_date on factor (status(8), method(8), date);
+Query OK, 0 rows affected (0.24 sec)
+Records: 0  Duplicates: 0  Warnings: 0
+
+mysql> create index num_id_factor_status on ecm (num_id, factor(8), status(8));
+Query OK, 0 rows affected (0.23 sec)
+Records: 0  Duplicates: 0  Warnings: 0
+
+mysql> create index num_id_factor_b1 on ecm (num_id, factor(8), b1);
+Query OK, 0 rows affected (0.23 sec)
+Records: 0  Duplicates: 0  Warnings: 0
